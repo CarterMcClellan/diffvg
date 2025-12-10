@@ -11,8 +11,7 @@ import importlib
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 from setuptools.command.install import install
-from distutils.sysconfig import get_config_var
-from distutils.version import LooseVersion
+from sysconfig import get_config_var
 
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir, build_with_cuda):
@@ -68,7 +67,6 @@ class Build(build_ext):
             super().build_extension(ext)
 
 torch_spec = importlib.util.find_spec("torch")
-tf_spec = importlib.util.find_spec("tensorflow")
 packages = []
 build_with_cuda = False
 if torch_spec is not None:
@@ -76,14 +74,8 @@ if torch_spec is not None:
     import torch
     if torch.cuda.is_available():
         build_with_cuda = True
-if tf_spec is not None and sys.platform != 'win32':
-    packages.append('pydiffvg_tensorflow')
-    if not build_with_cuda:
-        import tensorflow as tf
-        if tf.test.is_gpu_available(cuda_only=True, min_cuda_compute_capability=None):
-            build_with_cuda = True
 if len(packages) == 0:
-    print('Error: PyTorch or Tensorflow must be installed. For Windows platform only PyTorch is supported.')
+    print('Error: PyTorch must be installed.')
     exit()
 # Override build_with_cuda with environment variable
 if 'DIFFVG_CUDA' in os.environ:
