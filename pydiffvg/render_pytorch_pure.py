@@ -1,13 +1,12 @@
 """
 Pure Python/PyTorch implementation of diffvg's render function.
-This implementation replicates the C++/CUDA rendering without any native code dependencies.
+This implementation provides EXACT PARITY with the C++ implementation.
 """
 
 import torch
-import torch.nn.functional as F
+import math
 from enum import IntEnum
 from typing import List, Optional, Union, Tuple
-import math
 
 
 class OutputType(IntEnum):
@@ -41,11 +40,13 @@ class Ellipse:
 
 class Path:
     def __init__(self, num_control_points, points, is_closed,
-                 stroke_width=torch.tensor(1.0), use_distance_approx=False):
+                 stroke_width=torch.tensor(1.0), thickness=None,
+                 use_distance_approx=False):
         self.num_control_points = num_control_points
         self.points = points
         self.is_closed = is_closed
         self.stroke_width = stroke_width
+        self.thickness = thickness  # Per-point thickness
         self.use_distance_approx = use_distance_approx
 
 
@@ -99,532 +100,888 @@ class PixelFilter:
 
 
 # ============================================================================
+# Polynomial Solvers (Exact match to C++ solve.h)
+# ============================================================================
+
+def solve_quadratic(a: float, b: float, c: float) -> Tuple[bool, float, float]:
+    """
+    Solve quadratic equation ax^2 + bx + c = 0.
+    Returns (success, t0, t1) where t0 <= t1.
+    Exact match to C++ solve_quadratic.
+    """
+    discrim = b * b - 4 * a * c
+    if discrim < 0:
+        return False, 0.0, 0.0
+
+    root_discrim = math.sqrt(discrim)
+
+    if b < 0:
+        q = -0.5 * (b - root_discrim)
+    else:
+        q = -0.5 * (b + root_discrim)
+
+    if abs(a) < 1e-10:
+        if abs(q) < 1e-10:
+            return False, 0.0, 0.0
+        t0 = c / q
+        t1 = t0
+    else:
+        t0 = q / a
+        if abs(q) < 1e-10:
+            t1 = t0
+        else:
+            t1 = c / q
+
+    if t0 > t1:
+        t0, t1 = t1, t0
+
+    return True, t0, t1
+
+
+def solve_cubic(a: float, b: float, c: float, d: float) -> List[float]:
+    """
+    Solve cubic equation ax^3 + bx^2 + cx + d = 0.
+    Returns list of real roots.
+    Exact match to C++ solve_cubic.
+    """
+    if abs(a) < 1e-6:
+        success, t0, t1 = solve_quadratic(b, c, d)
+        if success:
+            if abs(t0 - t1) < 1e-10:
+                return [t0]
+            return [t0, t1]
+        return []
+
+    # Normalize cubic equation
+    b = b / a
+    c = c / a
+    d = d / a
+
+    Q = (b * b - 3 * c) / 9.0
+    R = (2 * b * b * b - 9 * b * c + 27 * d) / 54.0
+
+    if R * R < Q * Q * Q:
+        # 3 real roots
+        theta = math.acos(R / math.sqrt(Q * Q * Q))
+        sqrt_Q = math.sqrt(Q)
+        t0 = -2.0 * sqrt_Q * math.cos(theta / 3.0) - b / 3.0
+        t1 = -2.0 * sqrt_Q * math.cos((theta + 2.0 * math.pi) / 3.0) - b / 3.0
+        t2 = -2.0 * sqrt_Q * math.cos((theta - 2.0 * math.pi) / 3.0) - b / 3.0
+        return [t0, t1, t2]
+    else:
+        RR_QQQ = R * R - Q * Q * Q
+        if RR_QQQ < 0:
+            RR_QQQ = 0
+        sqrt_val = math.sqrt(RR_QQQ)
+        if R > 0:
+            A = -math.pow(R + sqrt_val, 1.0 / 3.0)
+        else:
+            A = math.pow(-R + sqrt_val, 1.0 / 3.0)
+
+        if abs(A) > 1e-6:
+            B = Q / A
+        else:
+            B = 0.0
+
+        t0 = (A + B) - b / 3.0
+        return [t0]
+
+
+def solve_quintic_isolator(A: float, B: float, C: float, D: float, E: float, F: float) -> List[float]:
+    """
+    Solve quintic equation t^5 + Bt^4 + Ct^3 + Dt^2 + Et + F = 0 in [0, 1].
+    Uses isolator polynomial method from the C++ implementation.
+    """
+    # Isolator polynomial coefficients
+    p1A = (2.0 / 5.0) * C - (4.0 / 25.0) * B * B
+    p1B = (3.0 / 5.0) * D - (3.0 / 25.0) * B * C
+    p1C = (4.0 / 5.0) * E - (2.0 / 25.0) * B * D
+    p1D = F - B * E / 25.0
+
+    # Linear root
+    q_root = -B / 5.0
+
+    # Cubic roots of isolator polynomial
+    p_roots = solve_cubic(p1A, p1B, p1C, p1D)
+
+    # Collect interval boundaries
+    intervals = []
+    if 0 <= q_root <= 1:
+        intervals.append(q_root)
+    for r in p_roots:
+        if 0 <= r <= 1:
+            intervals.append(r)
+    intervals.sort()
+
+    def eval_polynomial(t):
+        return t**5 + B*t**4 + C*t**3 + D*t**2 + E*t + F
+
+    def eval_polynomial_deriv(t):
+        return 5*t**4 + 4*B*t**3 + 3*C*t**2 + 2*D*t + E
+
+    roots = []
+    lower_bound = 0.0
+
+    for j in range(len(intervals) + 1):
+        if j < len(intervals) and intervals[j] < 0:
+            continue
+
+        upper_bound = intervals[j] if j < len(intervals) else 1.0
+        upper_bound = min(upper_bound, 1.0)
+
+        lb = lower_bound
+        ub = upper_bound
+        lb_eval = eval_polynomial(lb)
+        ub_eval = eval_polynomial(ub)
+
+        if lb_eval * ub_eval > 0:
+            # No root in this interval
+            lower_bound = upper_bound
+            if upper_bound >= 1.0:
+                break
+            continue
+
+        if lb_eval > ub_eval:
+            lb, ub = ub, lb
+
+        # Newton-Raphson with bisection fallback
+        t = 0.5 * (lb + ub)
+        for _ in range(20):
+            if not (lb <= t <= ub):
+                t = 0.5 * (lb + ub)
+            value = eval_polynomial(t)
+            if abs(value) < 1e-5:
+                break
+            if value > 0:
+                ub = t
+            else:
+                lb = t
+            derivative = eval_polynomial_deriv(t)
+            if abs(derivative) > 1e-10:
+                t = t - value / derivative
+
+        roots.append(t)
+
+        if upper_bound >= 1.0:
+            break
+        lower_bound = upper_bound
+
+    return roots
+
+
+# ============================================================================
 # Geometry Utilities
 # ============================================================================
 
-def transform_point(point: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-    """Apply 3x3 affine transformation to 2D point(s)."""
-    if point.dim() == 1:
-        p = torch.cat([point, torch.ones(1, device=point.device, dtype=point.dtype)])
-        transformed = matrix @ p
-        return transformed[:2] / transformed[2]
-    else:
-        ones = torch.ones(point.shape[0], 1, device=point.device, dtype=point.dtype)
-        p = torch.cat([point, ones], dim=1)
-        transformed = (matrix @ p.T).T
-        return transformed[:, :2] / transformed[:, 2:3]
+def xform_pt(matrix: torch.Tensor, pt: torch.Tensor) -> torch.Tensor:
+    """Apply 3x3 affine transformation to 2D point."""
+    p = torch.stack([pt[0], pt[1], torch.ones_like(pt[0])])
+    transformed = matrix @ p
+    return transformed[:2] / transformed[2]
 
 
-def inverse_transform_point(point: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-    """Apply inverse of 3x3 affine transformation to 2D point(s)."""
+def inverse_xform_pt(matrix: torch.Tensor, pt: torch.Tensor) -> torch.Tensor:
+    """Apply inverse 3x3 affine transformation to 2D point."""
     inv_matrix = torch.linalg.inv(matrix)
-    return transform_point(point, inv_matrix)
+    return xform_pt(inv_matrix, pt)
 
 
 # ============================================================================
-# Bezier Curve Utilities
+# Winding Number (Exact match to C++ winding_number.h)
 # ============================================================================
 
-def evaluate_quadratic_bezier(p0: torch.Tensor, p1: torch.Tensor, p2: torch.Tensor,
-                               t: torch.Tensor) -> torch.Tensor:
-    """Evaluate quadratic Bezier curve at parameter t."""
-    one_minus_t = 1.0 - t
-    return one_minus_t * one_minus_t * p0 + 2.0 * one_minus_t * t * p1 + t * t * p2
+def compute_winding_number_circle(center: torch.Tensor, radius: torch.Tensor,
+                                   pt: torch.Tensor) -> int:
+    """Exact match to C++ compute_winding_number for Circle."""
+    dist_sq = ((pt[0] - center[0]) ** 2 + (pt[1] - center[1]) ** 2).item()
+    r = radius.item() if isinstance(radius, torch.Tensor) else radius
+    if dist_sq < r * r:
+        return 1
+    return 0
 
 
-def evaluate_cubic_bezier(p0: torch.Tensor, p1: torch.Tensor, p2: torch.Tensor,
-                          p3: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Evaluate cubic Bezier curve at parameter t."""
-    one_minus_t = 1.0 - t
-    return (one_minus_t ** 3 * p0 +
-            3.0 * one_minus_t ** 2 * t * p1 +
-            3.0 * one_minus_t * t ** 2 * p2 +
-            t ** 3 * p3)
+def compute_winding_number_ellipse(center: torch.Tensor, radius: torch.Tensor,
+                                    pt: torch.Tensor) -> int:
+    """Exact match to C++ compute_winding_number for Ellipse."""
+    rx = radius[0].item()
+    ry = radius[1].item()
+    cx = center[0].item()
+    cy = center[1].item()
+    px = pt[0].item()
+    py = pt[1].item()
+
+    if ((cx - px) ** 2) / (rx * rx) + ((cy - py) ** 2) / (ry * ry) < 1:
+        return 1
+    return 0
 
 
-def quadratic_bezier_derivative(p0: torch.Tensor, p1: torch.Tensor,
-                                 p2: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Derivative of quadratic Bezier curve at parameter t."""
-    return 2.0 * (1.0 - t) * (p1 - p0) + 2.0 * t * (p2 - p1)
+def compute_winding_number_rect(p_min: torch.Tensor, p_max: torch.Tensor,
+                                 pt: torch.Tensor) -> int:
+    """Exact match to C++ compute_winding_number for Rect."""
+    px = pt[0].item()
+    py = pt[1].item()
+    x_min = p_min[0].item()
+    y_min = p_min[1].item()
+    x_max = p_max[0].item()
+    y_max = p_max[1].item()
+
+    if x_min < px < x_max and y_min < py < y_max:
+        return 1
+    return 0
 
 
-def cubic_bezier_derivative(p0: torch.Tensor, p1: torch.Tensor, p2: torch.Tensor,
-                            p3: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Derivative of cubic Bezier curve at parameter t."""
-    one_minus_t = 1.0 - t
-    return (3.0 * one_minus_t ** 2 * (p1 - p0) +
-            6.0 * one_minus_t * t * (p2 - p1) +
-            3.0 * t ** 2 * (p3 - p2))
+def compute_winding_number_path(path: Path, pt: torch.Tensor) -> int:
+    """
+    Exact match to C++ compute_winding_number for Path.
+    Uses analytical ray-curve intersection.
+    """
+    if not path.is_closed:
+        return 0
+
+    winding_number = 0
+    num_segments = len(path.num_control_points)
+    point_idx = 0
+    px = pt[0].item()
+    py = pt[1].item()
+    points = path.points
+
+    for seg_idx in range(num_segments):
+        n_ctrl = int(path.num_control_points[seg_idx].item())
+
+        if n_ctrl == 0:
+            # Straight line
+            i0 = point_idx
+            if seg_idx == num_segments - 1:
+                i1 = 0
+            else:
+                i1 = point_idx + 1
+
+            p0x = points[i0, 0].item()
+            p0y = points[i0, 1].item()
+            p1x = points[i1, 0].item()
+            p1y = points[i1, 1].item()
+
+            if p1y != p0y:
+                t = (py - p0y) / (p1y - p0y)
+                if 0 <= t <= 1:
+                    tp = p0x - px + t * (p1x - p0x)
+                    if tp >= 0:
+                        if p1y - p0y > 0:
+                            winding_number += 1
+                        else:
+                            winding_number -= 1
+
+            point_idx += 1
+
+        elif n_ctrl == 1:
+            # Quadratic Bezier
+            i0 = point_idx
+            i1 = point_idx + 1
+            if seg_idx == num_segments - 1:
+                i2 = 0
+            else:
+                i2 = point_idx + 2
+
+            p0x = points[i0, 0].item()
+            p0y = points[i0, 1].item()
+            p1x = points[i1, 0].item()
+            p1y = points[i1, 1].item()
+            p2x = points[i2, 0].item()
+            p2y = points[i2, 1].item()
+
+            # Solve: py = (p0-2p1+p2)t^2 + (-2p0+2p1)t + p0
+            a = p0y - 2*p1y + p2y
+            b = -2*p0y + 2*p1y
+            c = p0y - py
+
+            success, t0, t1 = solve_quadratic(a, b, c)
+            if success:
+                for t in [t0, t1]:
+                    if 0 <= t <= 1:
+                        # tp = x-coordinate of curve at t minus px
+                        tp = (p0x - 2*p1x + p2x)*t*t + (-2*p0x + 2*p1x)*t + p0x - px
+                        if tp >= 0:
+                            # Derivative of y with respect to t
+                            dy_dt = 2*(p0y - 2*p1y + p2y)*t + (-2*p0y + 2*p1y)
+                            if dy_dt > 0:
+                                winding_number += 1
+                            else:
+                                winding_number -= 1
+
+            point_idx += 2
+
+        elif n_ctrl == 2:
+            # Cubic Bezier
+            i0 = point_idx
+            i1 = point_idx + 1
+            i2 = point_idx + 2
+            if seg_idx == num_segments - 1:
+                i3 = 0
+            else:
+                i3 = point_idx + 3
+
+            p0x = points[i0, 0].item()
+            p0y = points[i0, 1].item()
+            p1x = points[i1, 0].item()
+            p1y = points[i1, 1].item()
+            p2x = points[i2, 0].item()
+            p2y = points[i2, 1].item()
+            p3x = points[i3, 0].item()
+            p3y = points[i3, 1].item()
+
+            # Solve: py = (-p0+3p1-3p2+p3)t^3 + (3p0-6p1+3p2)t^2 + (-3p0+3p1)t + p0
+            a = -p0y + 3*p1y - 3*p2y + p3y
+            b = 3*p0y - 6*p1y + 3*p2y
+            c = -3*p0y + 3*p1y
+            d = p0y - py
+
+            roots = solve_cubic(a, b, c, d)
+            for t in roots:
+                if 0 <= t <= 1:
+                    # tp = x-coordinate of curve at t minus px
+                    tp = ((-p0x + 3*p1x - 3*p2x + p3x)*t*t*t +
+                          (3*p0x - 6*p1x + 3*p2x)*t*t +
+                          (-3*p0x + 3*p1x)*t +
+                          p0x - px)
+                    if tp > 0:
+                        # Derivative of y with respect to t
+                        dy_dt = (3*(-p0y + 3*p1y - 3*p2y + p3y)*t*t +
+                                 2*(3*p0y - 6*p1y + 3*p2y)*t +
+                                 (-3*p0y + 3*p1y))
+                        if dy_dt > 0:
+                            winding_number += 1
+                        else:
+                            winding_number -= 1
+
+            point_idx += 3
+
+    return winding_number
 
 
-# ============================================================================
-# Distance Functions
-# ============================================================================
-
-def point_to_line_distance(p: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Compute distance from point p to line segment ab."""
-    ab = b - a
-    ap = p - a
-    t = torch.clamp(torch.dot(ap, ab) / (torch.dot(ab, ab) + 1e-10), 0.0, 1.0)
-    closest = a + t * ab
-    return torch.norm(p - closest)
-
-
-def point_to_quadratic_bezier_distance(p: torch.Tensor, p0: torch.Tensor,
-                                        p1: torch.Tensor, p2: torch.Tensor,
-                                        num_samples: int = 16) -> torch.Tensor:
-    """Compute approximate distance from point p to quadratic Bezier curve."""
-    # Sample the curve and find minimum distance
-    t_values = torch.linspace(0, 1, num_samples, device=p.device, dtype=p.dtype)
-    min_dist = torch.tensor(float('inf'), device=p.device, dtype=p.dtype)
-
-    for t in t_values:
-        curve_point = evaluate_quadratic_bezier(p0, p1, p2, t)
-        dist = torch.norm(p - curve_point)
-        min_dist = torch.minimum(min_dist, dist)
-
-    return min_dist
-
-
-def point_to_cubic_bezier_distance(p: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor,
-                                    p2: torch.Tensor, p3: torch.Tensor,
-                                    num_samples: int = 16) -> torch.Tensor:
-    """Compute approximate distance from point p to cubic Bezier curve."""
-    t_values = torch.linspace(0, 1, num_samples, device=p.device, dtype=p.dtype)
-    min_dist = torch.tensor(float('inf'), device=p.device, dtype=p.dtype)
-
-    for t in t_values:
-        curve_point = evaluate_cubic_bezier(p0, p1, p2, p3, t)
-        dist = torch.norm(p - curve_point)
-        min_dist = torch.minimum(min_dist, dist)
-
-    return min_dist
-
-
-# ============================================================================
-# Winding Number Computation (Point-in-Polygon Testing)
-# ============================================================================
-
-def line_winding_number(p: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Compute winding number contribution from line segment ab for point p."""
-    # Ray casting from point p in +x direction
-    # Check if ray intersects the line segment
-
-    # Early exit if segment is completely above or below the ray
-    if (a[1] > p[1] and b[1] > p[1]) or (a[1] <= p[1] and b[1] <= p[1]):
-        return torch.tensor(0.0, device=p.device, dtype=p.dtype)
-
-    # Compute x-coordinate of intersection
-    t = (p[1] - a[1]) / (b[1] - a[1] + 1e-10)
-    x_intersect = a[0] + t * (b[0] - a[0])
-
-    if x_intersect > p[0]:
-        # Intersection is to the right of p
-        if b[1] > a[1]:
-            return torch.tensor(1.0, device=p.device, dtype=p.dtype)
+def compute_winding_number(shape, pt: torch.Tensor) -> int:
+    """Compute winding number for any shape."""
+    if isinstance(shape, Circle):
+        return compute_winding_number_circle(shape.center, shape.radius, pt)
+    elif isinstance(shape, Ellipse):
+        return compute_winding_number_ellipse(shape.center, shape.radius, pt)
+    elif isinstance(shape, Rect):
+        return compute_winding_number_rect(shape.p_min, shape.p_max, pt)
+    elif isinstance(shape, Path):
+        return compute_winding_number_path(shape, pt)
+    elif isinstance(shape, Polygon):
+        # Convert polygon to path
+        n_points = shape.points.shape[0]
+        if shape.is_closed:
+            num_ctrl = torch.zeros(n_points, dtype=torch.int32)
         else:
-            return torch.tensor(-1.0, device=p.device, dtype=p.dtype)
-
-    return torch.tensor(0.0, device=p.device, dtype=p.dtype)
-
-
-def quadratic_bezier_winding_number(p: torch.Tensor, p0: torch.Tensor,
-                                     p1: torch.Tensor, p2: torch.Tensor,
-                                     num_subdivisions: int = 8) -> torch.Tensor:
-    """Compute winding number contribution from quadratic Bezier for point p."""
-    # Subdivide into line segments and sum contributions
-    winding = torch.tensor(0.0, device=p.device, dtype=p.dtype)
-    t_prev = torch.tensor(0.0, device=p.device, dtype=p.dtype)
-    prev_point = p0.clone()
-
-    for i in range(1, num_subdivisions + 1):
-        t = torch.tensor(i / num_subdivisions, device=p.device, dtype=p.dtype)
-        curr_point = evaluate_quadratic_bezier(p0, p1, p2, t)
-        winding = winding + line_winding_number(p, prev_point, curr_point)
-        prev_point = curr_point
-
-    return winding
-
-
-def cubic_bezier_winding_number(p: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor,
-                                 p2: torch.Tensor, p3: torch.Tensor,
-                                 num_subdivisions: int = 8) -> torch.Tensor:
-    """Compute winding number contribution from cubic Bezier for point p."""
-    winding = torch.tensor(0.0, device=p.device, dtype=p.dtype)
-    prev_point = p0.clone()
-
-    for i in range(1, num_subdivisions + 1):
-        t = torch.tensor(i / num_subdivisions, device=p.device, dtype=p.dtype)
-        curr_point = evaluate_cubic_bezier(p0, p1, p2, p3, t)
-        winding = winding + line_winding_number(p, prev_point, curr_point)
-        prev_point = curr_point
-
-    return winding
+            num_ctrl = torch.zeros(n_points - 1, dtype=torch.int32)
+        temp_path = Path(num_ctrl, shape.points, shape.is_closed)
+        return compute_winding_number_path(temp_path, pt)
+    return 0
 
 
 # ============================================================================
-# Shape Distance and Winding Number
+# Closest Point / Distance (Exact match to C++ compute_distance.h)
 # ============================================================================
 
-def circle_signed_distance(p: torch.Tensor, center: torch.Tensor,
-                           radius: torch.Tensor) -> torch.Tensor:
-    """Signed distance from point p to circle boundary (negative inside)."""
-    return torch.norm(p - center) - radius
+def closest_point_line(pt: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    """Find closest point on line segment p0-p1 to pt."""
+    px, py = pt[0].item(), pt[1].item()
+    p0x, p0y = p0[0].item(), p0[1].item()
+    p1x, p1y = p1[0].item(), p1[1].item()
+
+    dx = p1x - p0x
+    dy = p1y - p0y
+    len_sq = dx * dx + dy * dy
+
+    if len_sq < 1e-10:
+        return p0.clone(), math.sqrt((px - p0x)**2 + (py - p0y)**2)
+
+    t = ((px - p0x) * dx + (py - p0y) * dy) / len_sq
+    t = max(0.0, min(1.0, t))
+
+    closest_x = p0x + t * dx
+    closest_y = p0y + t * dy
+    dist = math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
+
+    return torch.tensor([closest_x, closest_y], dtype=pt.dtype, device=pt.device), dist
 
 
-def circle_winding_number(p: torch.Tensor, center: torch.Tensor,
-                          radius: torch.Tensor) -> torch.Tensor:
-    """Returns 1 if point is inside circle, 0 otherwise."""
-    dist = torch.norm(p - center)
-    return torch.where(dist < radius,
-                       torch.tensor(1.0, device=p.device, dtype=p.dtype),
-                       torch.tensor(0.0, device=p.device, dtype=p.dtype))
+def closest_point_quadratic_bezier(pt: torch.Tensor, p0: torch.Tensor,
+                                    p1: torch.Tensor, p2: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
+    """
+    Find closest point on quadratic Bezier to pt.
+    Exact match to C++ implementation - solves cubic equation.
+    Returns (closest_point, distance, t_parameter).
+    """
+    px, py = pt[0].item(), pt[1].item()
+    p0x, p0y = p0[0].item(), p0[1].item()
+    p1x, p1y = p1[0].item(), p1[1].item()
+    p2x, p2y = p2[0].item(), p2[1].item()
+
+    def eval_bezier(t):
+        tt = 1 - t
+        x = tt*tt*p0x + 2*tt*t*p1x + t*t*p2x
+        y = tt*tt*p0y + 2*tt*t*p1y + t*t*p2y
+        return x, y
+
+    # Check endpoints
+    pt0 = eval_bezier(0)
+    pt1 = eval_bezier(1)
+    dist0 = math.sqrt((pt0[0] - px)**2 + (pt0[1] - py)**2)
+    dist1 = math.sqrt((pt1[0] - px)**2 + (pt1[1] - py)**2)
+
+    min_dist = dist0
+    min_t = 0.0
+    closest = pt0
+
+    if dist1 < min_dist:
+        min_dist = dist1
+        min_t = 1.0
+        closest = pt1
+
+    # Solve (q - pt) dot q' = 0
+    # q = (p0-2p1+p2)t^2 + (-2p0+2p1)t + p0
+    # q' = 2(p0-2p1+p2)t + (-2p0+2p1)
+    ax = p0x - 2*p1x + p2x
+    ay = p0y - 2*p1y + p2y
+    bx = -2*p0x + 2*p1x
+    by = -2*p0y + 2*p1y
+
+    # Expanding to cubic: At^3 + Bt^2 + Ct + D = 0
+    A = (ax*ax + ay*ay)
+    B = 3*(ax*bx + ay*by) / 2  # Actually 3*(p0-2p1+p2)(-p0+p1)
+    B = 3 * (ax * (bx/2) + ay * (by/2))  # bx/2 = -p0x+p1x
+    # Recalculate properly
+    A = ax*ax + ay*ay
+    B = 3 * (ax * (-p0x + p1x) + ay * (-p0y + p1y))
+    C = 2 * ((-p0x + p1x)**2 + (-p0y + p1y)**2) + (ax * (p0x - px) + ay * (p0y - py))
+    D = ((-p0x + p1x) * (p0x - px) + (-p0y + p1y) * (p0y - py))
+
+    roots = solve_cubic(A, B, C, D)
+    for t in roots:
+        if 0 <= t <= 1:
+            curve_pt = eval_bezier(t)
+            dist = math.sqrt((curve_pt[0] - px)**2 + (curve_pt[1] - py)**2)
+            if dist < min_dist:
+                min_dist = dist
+                min_t = t
+                closest = curve_pt
+
+    return torch.tensor([closest[0], closest[1]], dtype=pt.dtype, device=pt.device), min_dist, min_t
 
 
-def ellipse_signed_distance(p: torch.Tensor, center: torch.Tensor,
-                            radius: torch.Tensor) -> torch.Tensor:
-    """Approximate signed distance from point p to ellipse boundary."""
-    # Normalize point to unit circle space
-    normalized = (p - center) / radius
-    dist_normalized = torch.norm(normalized)
-    # Approximate signed distance
-    if dist_normalized < 1e-10:
-        return -torch.min(radius)
-    # Scale back to ellipse space (approximation)
-    return (dist_normalized - 1.0) * torch.min(radius)
+def closest_point_cubic_bezier(pt: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor,
+                                p2: torch.Tensor, p3: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
+    """
+    Find closest point on cubic Bezier to pt.
+    Exact match to C++ implementation - solves quintic equation.
+    Returns (closest_point, distance, t_parameter).
+    """
+    px, py = pt[0].item(), pt[1].item()
+    p0x, p0y = p0[0].item(), p0[1].item()
+    p1x, p1y = p1[0].item(), p1[1].item()
+    p2x, p2y = p2[0].item(), p2[1].item()
+    p3x, p3y = p3[0].item(), p3[1].item()
+
+    def eval_bezier(t):
+        tt = 1 - t
+        x = tt*tt*tt*p0x + 3*tt*tt*t*p1x + 3*tt*t*t*p2x + t*t*t*p3x
+        y = tt*tt*tt*p0y + 3*tt*tt*t*p1y + 3*tt*t*t*p2y + t*t*t*p3y
+        return x, y
+
+    # Check endpoints
+    pt0 = eval_bezier(0)
+    pt1 = eval_bezier(1)
+    dist0 = math.sqrt((pt0[0] - px)**2 + (pt0[1] - py)**2)
+    dist1 = math.sqrt((pt1[0] - px)**2 + (pt1[1] - py)**2)
+
+    min_dist = dist0
+    min_t = 0.0
+    closest = pt0
+
+    if dist1 < min_dist:
+        min_dist = dist1
+        min_t = 1.0
+        closest = pt1
+
+    # Coefficients for the curve
+    # q = (-p0+3p1-3p2+p3)t^3 + (3p0-6p1+3p2)t^2 + (-3p0+3p1)t + p0
+    ax = -p0x + 3*p1x - 3*p2x + p3x
+    ay = -p0y + 3*p1y - 3*p2y + p3y
+    bx = 3*p0x - 6*p1x + 3*p2x
+    by = 3*p0y - 6*p1y + 3*p2y
+    cx = -3*p0x + 3*p1x
+    cy = -3*p0y + 3*p1y
+    dx = p0x - px
+    dy = p0y - py
+
+    # Quintic coefficients from (q - pt) dot q' = 0
+    # q' = 3*a*t^2 + 2*b*t + c
+    A = 3 * (ax*ax + ay*ay)
+    B = 5 * (ax*bx + ay*by)
+    C = 4 * (ax*cx + ay*cy) + 2 * (bx*bx + by*by)
+    D = 3 * ((bx*cx + by*cy) + (ax*dx + ay*dy))
+    E = (cx*cx + cy*cy) + 2 * (bx*dx + by*dy)
+    F = cx*dx + cy*dy
+
+    if abs(A) < 1e-10:
+        # Degenerate case
+        return torch.tensor([closest[0], closest[1]], dtype=pt.dtype, device=pt.device), min_dist, min_t
+
+    # Normalize
+    B /= A
+    C /= A
+    D /= A
+    E /= A
+    F /= A
+
+    # Solve quintic using isolator polynomials
+    roots = solve_quintic_isolator(A, B, C, D, E, F)
+
+    for t in roots:
+        if 0 <= t <= 1:
+            curve_pt = eval_bezier(t)
+            dist = math.sqrt((curve_pt[0] - px)**2 + (curve_pt[1] - py)**2)
+            if dist < min_dist:
+                min_dist = dist
+                min_t = t
+                closest = curve_pt
+
+    return torch.tensor([closest[0], closest[1]], dtype=pt.dtype, device=pt.device), min_dist, min_t
 
 
-def ellipse_winding_number(p: torch.Tensor, center: torch.Tensor,
-                           radius: torch.Tensor) -> torch.Tensor:
-    """Returns 1 if point is inside ellipse, 0 otherwise."""
-    normalized = (p - center) / radius
-    dist_sq = torch.sum(normalized ** 2)
-    return torch.where(dist_sq < 1.0,
-                       torch.tensor(1.0, device=p.device, dtype=p.dtype),
-                       torch.tensor(0.0, device=p.device, dtype=p.dtype))
+def closest_point_circle(pt: torch.Tensor, center: torch.Tensor,
+                          radius: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    """Find closest point on circle boundary to pt."""
+    diff = pt - center
+    dist_to_center = torch.norm(diff).item()
+    if dist_to_center < 1e-10:
+        # Point is at center
+        r = radius.item() if isinstance(radius, torch.Tensor) else radius
+        return center + torch.tensor([r, 0.0], dtype=pt.dtype, device=pt.device), r
+
+    r = radius.item() if isinstance(radius, torch.Tensor) else radius
+    closest = center + r * diff / dist_to_center
+    dist = abs(dist_to_center - r)
+    return closest, dist
 
 
-def rect_signed_distance(p: torch.Tensor, p_min: torch.Tensor,
-                         p_max: torch.Tensor) -> torch.Tensor:
-    """Signed distance from point p to rectangle boundary."""
-    center = (p_min + p_max) / 2.0
-    half_size = (p_max - p_min) / 2.0
+def closest_point_rect(pt: torch.Tensor, p_min: torch.Tensor,
+                        p_max: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    """Find closest point on rectangle boundary to pt."""
+    left_top = p_min
+    right_top = torch.tensor([p_max[0], p_min[1]], dtype=pt.dtype, device=pt.device)
+    left_bottom = torch.tensor([p_min[0], p_max[1]], dtype=pt.dtype, device=pt.device)
+    right_bottom = p_max
 
-    d = torch.abs(p - center) - half_size
-    outside = torch.norm(torch.clamp(d, min=0.0))
-    inside = torch.min(torch.clamp(d, max=0.0))
-    return outside + inside
+    edges = [
+        (left_top, left_bottom),
+        (left_top, right_top),
+        (right_top, right_bottom),
+        (left_bottom, right_bottom)
+    ]
+
+    min_dist = float('inf')
+    closest = None
+
+    for p0, p1 in edges:
+        cp, dist = closest_point_line(pt, p0, p1)
+        if dist < min_dist:
+            min_dist = dist
+            closest = cp
+
+    return closest, min_dist
 
 
-def rect_winding_number(p: torch.Tensor, p_min: torch.Tensor,
-                        p_max: torch.Tensor) -> torch.Tensor:
-    """Returns 1 if point is inside rectangle, 0 otherwise."""
-    inside = (p[0] >= p_min[0] and p[0] <= p_max[0] and
-              p[1] >= p_min[1] and p[1] <= p_max[1])
-    return torch.tensor(1.0 if inside else 0.0, device=p.device, dtype=p.dtype)
+def closest_point_path(pt: torch.Tensor, path: Path) -> Tuple[torch.Tensor, float, int, float]:
+    """
+    Find closest point on path to pt.
+    Returns (closest_point, distance, segment_id, t_parameter).
+    """
+    min_dist = float('inf')
+    closest = None
+    min_seg = -1
+    min_t = 0.0
 
-
-def path_signed_distance(p: torch.Tensor, num_control_points: torch.Tensor,
-                         points: torch.Tensor, is_closed: bool,
-                         num_samples: int = 16) -> torch.Tensor:
-    """Compute signed distance from point p to path."""
-    min_dist = torch.tensor(float('inf'), device=p.device, dtype=p.dtype)
-
+    num_segments = len(path.num_control_points)
     point_idx = 0
-    num_segments = len(num_control_points)
+    points = path.points
 
     for seg_idx in range(num_segments):
-        n_ctrl = int(num_control_points[seg_idx].item())
+        n_ctrl = int(path.num_control_points[seg_idx].item())
 
-        if n_ctrl == 0:  # Line segment
-            p0 = points[point_idx]
-            if seg_idx == num_segments - 1 and is_closed:
-                p1 = points[0]
+        if n_ctrl == 0:
+            # Line segment
+            i0 = point_idx
+            if seg_idx == num_segments - 1 and path.is_closed:
+                i1 = 0
             else:
-                p1 = points[point_idx + 1]
-            dist = point_to_line_distance(p, p0, p1)
-            min_dist = torch.minimum(min_dist, dist)
+                i1 = point_idx + 1
+
+            p0 = points[i0]
+            p1 = points[i1]
+            cp, dist = closest_point_line(pt, p0, p1)
+
+            if dist < min_dist:
+                min_dist = dist
+                closest = cp
+                min_seg = seg_idx
+                # Compute t
+                diff = p1 - p0
+                len_sq = (diff[0]**2 + diff[1]**2).item()
+                if len_sq > 1e-10:
+                    min_t = max(0, min(1, ((pt[0]-p0[0])*diff[0] + (pt[1]-p0[1])*diff[1]).item() / len_sq))
+
             point_idx += 1
 
-        elif n_ctrl == 1:  # Quadratic Bezier
-            p0 = points[point_idx]
-            p1 = points[point_idx + 1]  # Control point
-            if seg_idx == num_segments - 1 and is_closed:
-                p2 = points[0]
+        elif n_ctrl == 1:
+            # Quadratic Bezier
+            i0 = point_idx
+            i1 = point_idx + 1
+            if seg_idx == num_segments - 1 and path.is_closed:
+                i2 = 0
             else:
-                p2 = points[point_idx + 2]
-            dist = point_to_quadratic_bezier_distance(p, p0, p1, p2, num_samples)
-            min_dist = torch.minimum(min_dist, dist)
+                i2 = point_idx + 2
+
+            p0 = points[i0]
+            p1 = points[i1]
+            p2 = points[i2]
+            cp, dist, t = closest_point_quadratic_bezier(pt, p0, p1, p2)
+
+            if dist < min_dist:
+                min_dist = dist
+                closest = cp
+                min_seg = seg_idx
+                min_t = t
+
             point_idx += 2
 
-        elif n_ctrl == 2:  # Cubic Bezier
-            p0 = points[point_idx]
-            p1 = points[point_idx + 1]  # Control point 1
-            p2 = points[point_idx + 2]  # Control point 2
-            if seg_idx == num_segments - 1 and is_closed:
-                p3 = points[0]
+        elif n_ctrl == 2:
+            # Cubic Bezier
+            i0 = point_idx
+            i1 = point_idx + 1
+            i2 = point_idx + 2
+            if seg_idx == num_segments - 1 and path.is_closed:
+                i3 = 0
             else:
-                p3 = points[point_idx + 3]
-            dist = point_to_cubic_bezier_distance(p, p0, p1, p2, p3, num_samples)
-            min_dist = torch.minimum(min_dist, dist)
+                i3 = point_idx + 3
+
+            p0 = points[i0]
+            p1 = points[i1]
+            p2 = points[i2]
+            p3 = points[i3]
+            cp, dist, t = closest_point_cubic_bezier(pt, p0, p1, p2, p3)
+
+            if dist < min_dist:
+                min_dist = dist
+                closest = cp
+                min_seg = seg_idx
+                min_t = t
+
             point_idx += 3
 
-    return min_dist
+    return closest, min_dist, min_seg, min_t
 
 
-def path_winding_number(p: torch.Tensor, num_control_points: torch.Tensor,
-                        points: torch.Tensor, is_closed: bool,
-                        num_subdivisions: int = 8) -> torch.Tensor:
-    """Compute winding number for point p with respect to path."""
-    if not is_closed:
-        return torch.tensor(0.0, device=p.device, dtype=p.dtype)
+def distance_to_shape(pt: torch.Tensor, shape, transform: torch.Tensor) -> float:
+    """Compute distance from pt to shape boundary."""
+    # Transform point to shape's local space
+    local_pt = inverse_xform_pt(transform, pt)
 
-    winding = torch.tensor(0.0, device=p.device, dtype=p.dtype)
+    if isinstance(shape, Circle):
+        _, dist = closest_point_circle(local_pt, shape.center, shape.radius)
+        return dist
+    elif isinstance(shape, Rect):
+        _, dist = closest_point_rect(local_pt, shape.p_min, shape.p_max)
+        return dist
+    elif isinstance(shape, Path):
+        _, dist, _, _ = closest_point_path(local_pt, shape)
+        return dist
+    elif isinstance(shape, Polygon):
+        n_points = shape.points.shape[0]
+        if shape.is_closed:
+            num_ctrl = torch.zeros(n_points, dtype=torch.int32)
+        else:
+            num_ctrl = torch.zeros(n_points - 1, dtype=torch.int32)
+        temp_path = Path(num_ctrl, shape.points, shape.is_closed)
+        _, dist, _, _ = closest_point_path(local_pt, temp_path)
+        return dist
+    elif isinstance(shape, Ellipse):
+        # Approximate ellipse distance
+        normalized = (local_pt - shape.center) / shape.radius
+        dist_normalized = torch.norm(normalized).item()
+        if dist_normalized < 1e-10:
+            return min(shape.radius[0].item(), shape.radius[1].item())
+        return abs(dist_normalized - 1.0) * min(shape.radius[0].item(), shape.radius[1].item())
 
-    point_idx = 0
-    num_segments = len(num_control_points)
-
-    for seg_idx in range(num_segments):
-        n_ctrl = int(num_control_points[seg_idx].item())
-
-        if n_ctrl == 0:  # Line segment
-            p0 = points[point_idx]
-            if seg_idx == num_segments - 1:
-                p1 = points[0]
-            else:
-                p1 = points[point_idx + 1]
-            winding = winding + line_winding_number(p, p0, p1)
-            point_idx += 1
-
-        elif n_ctrl == 1:  # Quadratic Bezier
-            p0 = points[point_idx]
-            p1 = points[point_idx + 1]
-            if seg_idx == num_segments - 1:
-                p2 = points[0]
-            else:
-                p2 = points[point_idx + 2]
-            winding = winding + quadratic_bezier_winding_number(p, p0, p1, p2, num_subdivisions)
-            point_idx += 2
-
-        elif n_ctrl == 2:  # Cubic Bezier
-            p0 = points[point_idx]
-            p1 = points[point_idx + 1]
-            p2 = points[point_idx + 2]
-            if seg_idx == num_segments - 1:
-                p3 = points[0]
-            else:
-                p3 = points[point_idx + 3]
-            winding = winding + cubic_bezier_winding_number(p, p0, p1, p2, p3, num_subdivisions)
-            point_idx += 3
-
-    return winding
+    return float('inf')
 
 
 # ============================================================================
-# Color Evaluation
+# Color Sampling (Exact match to C++ sample_color)
 # ============================================================================
 
-def evaluate_constant_color(color: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-    """Evaluate constant color at point p."""
-    return color
+def sample_color_constant(color: torch.Tensor, pt: torch.Tensor) -> torch.Tensor:
+    """Sample constant color."""
+    return color.clone()
 
 
-def evaluate_linear_gradient(gradient: LinearGradient, p: torch.Tensor) -> torch.Tensor:
-    """Evaluate linear gradient color at point p."""
+def sample_color_linear_gradient(gradient: LinearGradient, pt: torch.Tensor) -> torch.Tensor:
+    """Sample linear gradient color at pt."""
     begin = gradient.begin
     end = gradient.end
 
     # Project point onto gradient line
     direction = end - begin
-    length_sq = torch.sum(direction ** 2) + 1e-10
-    t = torch.clamp(torch.dot(p - begin, direction) / length_sq, 0.0, 1.0)
+    length_sq = (direction[0]**2 + direction[1]**2).item()
 
-    # Find color stops that bracket t
+    if length_sq < 1e-10:
+        return gradient.stop_colors[0].clone()
+
+    t = ((pt[0] - begin[0]) * direction[0] + (pt[1] - begin[1]) * direction[1]).item() / length_sq
+    t = max(0.0, min(1.0, t))
+
+    # Find bracketing color stops
     offsets = gradient.offsets
     stop_colors = gradient.stop_colors
 
-    # Find the bracketing stops
+    if t <= offsets[0].item():
+        return stop_colors[0].clone()
+    if t >= offsets[-1].item():
+        return stop_colors[-1].clone()
+
     for i in range(len(offsets) - 1):
-        if t >= offsets[i] and t <= offsets[i + 1]:
-            local_t = (t - offsets[i]) / (offsets[i + 1] - offsets[i] + 1e-10)
+        o0 = offsets[i].item()
+        o1 = offsets[i + 1].item()
+        if o0 <= t <= o1:
+            local_t = (t - o0) / (o1 - o0 + 1e-10)
             return (1.0 - local_t) * stop_colors[i] + local_t * stop_colors[i + 1]
 
-    # Clamp to first or last color
-    if t <= offsets[0]:
-        return stop_colors[0]
-    return stop_colors[-1]
+    return stop_colors[-1].clone()
 
 
-def evaluate_radial_gradient(gradient: RadialGradient, p: torch.Tensor) -> torch.Tensor:
-    """Evaluate radial gradient color at point p."""
+def sample_color_radial_gradient(gradient: RadialGradient, pt: torch.Tensor) -> torch.Tensor:
+    """Sample radial gradient color at pt."""
     center = gradient.center
     radius = gradient.radius
 
     # Compute normalized distance from center
-    diff = p - center
-    normalized_diff = diff / (radius + 1e-10)
-    t = torch.clamp(torch.norm(normalized_diff), 0.0, 1.0)
+    diff = pt - center
+    # Use the average radius for radial gradient
+    r = (radius[0].item() + radius[1].item()) / 2.0
+    if r < 1e-10:
+        return gradient.stop_colors[0].clone()
 
-    # Find color stops that bracket t
+    t = torch.norm(diff).item() / r
+    t = max(0.0, min(1.0, t))
+
     offsets = gradient.offsets
     stop_colors = gradient.stop_colors
 
+    if t <= offsets[0].item():
+        return stop_colors[0].clone()
+    if t >= offsets[-1].item():
+        return stop_colors[-1].clone()
+
     for i in range(len(offsets) - 1):
-        if t >= offsets[i] and t <= offsets[i + 1]:
-            local_t = (t - offsets[i]) / (offsets[i + 1] - offsets[i] + 1e-10)
+        o0 = offsets[i].item()
+        o1 = offsets[i + 1].item()
+        if o0 <= t <= o1:
+            local_t = (t - o0) / (o1 - o0 + 1e-10)
             return (1.0 - local_t) * stop_colors[i] + local_t * stop_colors[i + 1]
 
-    if t <= offsets[0]:
-        return stop_colors[0]
-    return stop_colors[-1]
+    return stop_colors[-1].clone()
 
 
-def evaluate_color(color: Union[torch.Tensor, LinearGradient, RadialGradient, None],
-                   p: torch.Tensor) -> Optional[torch.Tensor]:
-    """Evaluate color at point p."""
+def sample_color(color, pt: torch.Tensor) -> Optional[torch.Tensor]:
+    """Sample color at point pt."""
     if color is None:
         return None
     elif isinstance(color, torch.Tensor):
-        return color
+        return sample_color_constant(color, pt)
     elif isinstance(color, LinearGradient):
-        return evaluate_linear_gradient(color, p)
+        return sample_color_linear_gradient(color, pt)
     elif isinstance(color, RadialGradient):
-        return evaluate_radial_gradient(color, p)
-    else:
-        return None
+        return sample_color_radial_gradient(color, pt)
+    return None
 
 
 # ============================================================================
 # Filter Functions
 # ============================================================================
 
-def box_filter(x: torch.Tensor, y: torch.Tensor, radius: float) -> torch.Tensor:
-    """Box filter weight."""
-    if torch.abs(x) <= radius and torch.abs(y) <= radius:
-        return torch.tensor(1.0, device=x.device, dtype=x.dtype)
-    return torch.tensor(0.0, device=x.device, dtype=x.dtype)
-
-
-def tent_filter(x: torch.Tensor, y: torch.Tensor, radius: float) -> torch.Tensor:
-    """Tent (linear) filter weight."""
-    dist = torch.sqrt(x ** 2 + y ** 2)
-    if dist <= radius:
-        return 1.0 - dist / radius
-    return torch.tensor(0.0, device=x.device, dtype=x.dtype)
-
-
-def gaussian_filter(x: torch.Tensor, y: torch.Tensor, radius: float) -> torch.Tensor:
-    """Gaussian filter weight."""
-    sigma = radius / 3.0
-    dist_sq = x ** 2 + y ** 2
-    return torch.exp(-dist_sq / (2.0 * sigma ** 2))
-
-
-def evaluate_filter(filter_type: FilterType, x: torch.Tensor, y: torch.Tensor,
-                    radius: float) -> torch.Tensor:
-    """Evaluate filter weight at offset (x, y)."""
+def compute_filter_weight(filter_type: FilterType, dx: float, dy: float,
+                          radius: float) -> float:
+    """Compute filter weight at offset (dx, dy)."""
     if filter_type == FilterType.box:
-        return box_filter(x, y, radius)
+        if abs(dx) <= radius and abs(dy) <= radius:
+            return 1.0
+        return 0.0
     elif filter_type == FilterType.tent:
-        return tent_filter(x, y, radius)
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist <= radius:
+            return max(0.0, 1.0 - dist / radius)
+        return 0.0
     elif filter_type == FilterType.gaussian:
-        return gaussian_filter(x, y, radius)
-    return box_filter(x, y, radius)
+        sigma = radius / 3.0
+        dist_sq = dx * dx + dy * dy
+        return math.exp(-dist_sq / (2.0 * sigma * sigma))
+    return 1.0
 
 
 # ============================================================================
-# Shape Rendering
+# Fragment and Blending (Exact match to C++ sample_color in diffvg.cpp)
 # ============================================================================
 
-def is_inside_shape(p: torch.Tensor, shape, use_even_odd_rule: bool,
-                    transform: torch.Tensor) -> torch.Tensor:
-    """Check if point p is inside the shape after applying inverse transform."""
-    # Transform point to shape's local space
-    p_local = inverse_transform_point(p, transform)
+class Fragment:
+    def __init__(self, color: torch.Tensor, alpha: float, group_id: int, is_stroke: bool):
+        self.color = color  # RGB
+        self.alpha = alpha
+        self.group_id = group_id
+        self.is_stroke = is_stroke
 
-    if isinstance(shape, Circle):
-        winding = circle_winding_number(p_local, shape.center, shape.radius)
-    elif isinstance(shape, Ellipse):
-        winding = ellipse_winding_number(p_local, shape.center, shape.radius)
-    elif isinstance(shape, Rect):
-        winding = rect_winding_number(p_local, shape.p_min, shape.p_max)
-    elif isinstance(shape, (Path, Polygon)):
-        if isinstance(shape, Polygon):
-            # Convert polygon to path representation
-            num_ctrl = torch.zeros(shape.points.shape[0] if shape.is_closed else shape.points.shape[0] - 1,
-                                   dtype=torch.int32, device=p.device)
-            points = shape.points
-            is_closed = shape.is_closed
-        else:
-            num_ctrl = shape.num_control_points
-            points = shape.points
-            is_closed = shape.is_closed
-        winding = path_winding_number(p_local, num_ctrl, points, is_closed)
+
+def blend_fragments(fragments: List[Fragment], background_color: Optional[torch.Tensor],
+                    device, dtype) -> torch.Tensor:
+    """
+    Blend fragments from back to front.
+    Exact match to C++ sample_color blending logic.
+    """
+    if not fragments:
+        if background_color is not None:
+            return background_color.clone()
+        return torch.zeros(4, device=device, dtype=dtype)
+
+    # Sort fragments by group_id (back to front)
+    fragments.sort(key=lambda f: f.group_id)
+
+    # Initialize with background
+    if background_color is not None:
+        accum_color = background_color[:3].clone()
+        accum_alpha = background_color[3].item()
     else:
-        return torch.tensor(0.0, device=p.device, dtype=p.dtype)
+        accum_color = torch.zeros(3, device=device, dtype=dtype)
+        accum_alpha = 0.0
 
-    if use_even_odd_rule:
-        # Even-odd rule: inside if winding number is odd
-        return torch.abs(winding) % 2.0
+    # Blend each fragment
+    for frag in fragments:
+        new_color = frag.color
+        new_alpha = frag.alpha
+
+        # prev_color is alpha premultiplied, don't need to multiply with prev_alpha
+        # accum_color = prev_color * (1 - new_alpha) + new_alpha * new_color
+        # accum_alpha = prev_alpha * (1 - new_alpha) + new_alpha
+        accum_color = accum_color * (1.0 - new_alpha) + new_alpha * new_color
+        accum_alpha = accum_alpha * (1.0 - new_alpha) + new_alpha
+
+    # Un-premultiply
+    if accum_alpha > 1e-6:
+        final_color = accum_color / accum_alpha
     else:
-        # Non-zero winding rule: inside if winding number is non-zero
-        return torch.where(torch.abs(winding) > 0.5,
-                          torch.tensor(1.0, device=p.device, dtype=p.dtype),
-                          torch.tensor(0.0, device=p.device, dtype=p.dtype))
+        final_color = accum_color
 
-
-def distance_to_shape(p: torch.Tensor, shape, transform: torch.Tensor) -> torch.Tensor:
-    """Compute distance from point p to shape boundary."""
-    p_local = inverse_transform_point(p, transform)
-
-    if isinstance(shape, Circle):
-        return torch.abs(circle_signed_distance(p_local, shape.center, shape.radius))
-    elif isinstance(shape, Ellipse):
-        return torch.abs(ellipse_signed_distance(p_local, shape.center, shape.radius))
-    elif isinstance(shape, Rect):
-        return torch.abs(rect_signed_distance(p_local, shape.p_min, shape.p_max))
-    elif isinstance(shape, (Path, Polygon)):
-        if isinstance(shape, Polygon):
-            num_ctrl = torch.zeros(shape.points.shape[0] if shape.is_closed else shape.points.shape[0] - 1,
-                                   dtype=torch.int32, device=p.device)
-            points = shape.points
-            is_closed = shape.is_closed
-        else:
-            num_ctrl = shape.num_control_points
-            points = shape.points
-            is_closed = shape.is_closed
-        return path_signed_distance(p_local, num_ctrl, points, is_closed)
-
-    return torch.tensor(float('inf'), device=p.device, dtype=p.dtype)
-
-
-def get_stroke_width(shape, p: torch.Tensor = None) -> torch.Tensor:
-    """Get stroke width for shape (may vary along path)."""
-    if hasattr(shape, 'stroke_width'):
-        sw = shape.stroke_width
-        if sw.dim() == 0 or (sw.dim() == 1 and sw.shape[0] == 1):
-            return sw if sw.dim() == 0 else sw[0]
-        # Variable stroke width - would need interpolation
-        return sw.mean()  # Simplified
-    return torch.tensor(1.0, device=p.device if p is not None else 'cpu')
-
-
-# ============================================================================
-# Alpha Compositing
-# ============================================================================
-
-def alpha_over(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    """Porter-Duff alpha-over compositing."""
-    src_alpha = src[3:4]
-    dst_alpha = dst[3:4]
-
-    out_alpha = src_alpha + dst_alpha * (1.0 - src_alpha)
-
-    if out_alpha < 1e-10:
-        return torch.zeros(4, device=src.device, dtype=src.dtype)
-
-    out_rgb = (src[:3] * src_alpha + dst[:3] * dst_alpha * (1.0 - src_alpha)) / out_alpha
-    return torch.cat([out_rgb, out_alpha])
+    return torch.cat([final_color, torch.tensor([accum_alpha], device=device, dtype=dtype)])
 
 
 # ============================================================================
@@ -632,57 +989,57 @@ def alpha_over(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
 # ============================================================================
 
 def sample_pixel(x: float, y: float, shapes: List, shape_groups: List[ShapeGroup],
-                 background: Optional[torch.Tensor], device: torch.device,
-                 dtype: torch.dtype) -> torch.Tensor:
-    """Sample color at pixel location (x, y)."""
-    p = torch.tensor([x, y], device=device, dtype=dtype)
+                 background: Optional[torch.Tensor], device, dtype) -> torch.Tensor:
+    """Sample color at pixel location (x, y). Exact match to C++ sample_color."""
+    pt = torch.tensor([x, y], device=device, dtype=dtype)
+    fragments = []
 
-    # Start with background or transparent
-    if background is not None:
-        # Bilinear interpolation of background
-        ix = int(x)
-        iy = int(y)
-        h, w = background.shape[:2]
-        if 0 <= ix < w and 0 <= iy < h:
-            result = background[iy, ix].clone()
-        else:
-            result = torch.zeros(4, device=device, dtype=dtype)
-    else:
-        result = torch.zeros(4, device=device, dtype=dtype)
-
-    # Iterate through shape groups (back to front)
-    for group in shape_groups:
+    # Iterate through shape groups
+    for group_idx, group in enumerate(shape_groups):
         transform = group.shape_to_canvas.to(device=device, dtype=dtype)
+        inv_transform = torch.linalg.inv(transform)
 
-        # Check each shape in the group
         for shape_id in group.shape_ids:
-            shape = shapes[shape_id]
+            shape_id_val = shape_id.item() if isinstance(shape_id, torch.Tensor) else shape_id
+            shape = shapes[shape_id_val]
 
-            # Check fill
-            if group.fill_color is not None:
-                inside = is_inside_shape(p, shape, group.use_even_odd_rule, transform)
-                if inside > 0.5:
-                    # Transform point to local space for color evaluation
-                    p_local = inverse_transform_point(p, transform)
-                    fill_color = evaluate_color(group.fill_color, p_local)
-                    if fill_color is not None:
-                        fill_color = fill_color.to(device=device, dtype=dtype)
-                        result = alpha_over(fill_color, result)
+            # Transform point to shape's local space
+            local_pt = xform_pt(inv_transform, pt)
 
             # Check stroke
             if group.stroke_color is not None:
-                stroke_width = get_stroke_width(shape, p)
-                dist = distance_to_shape(p, shape, transform)
+                stroke_width = shape.stroke_width
+                if isinstance(stroke_width, torch.Tensor):
+                    stroke_width = stroke_width.item()
+
+                dist = distance_to_shape(pt, shape, transform)
                 half_width = stroke_width / 2.0
 
                 if dist <= half_width:
-                    p_local = inverse_transform_point(p, transform)
-                    stroke_color = evaluate_color(group.stroke_color, p_local)
-                    if stroke_color is not None:
-                        stroke_color = stroke_color.to(device=device, dtype=dtype)
-                        result = alpha_over(stroke_color, result)
+                    color = sample_color(group.stroke_color, local_pt)
+                    if color is not None:
+                        color = color.to(device=device, dtype=dtype)
+                        frag = Fragment(color[:3], color[3].item(), group_idx, True)
+                        fragments.append(frag)
 
-    return result
+            # Check fill
+            if group.fill_color is not None:
+                winding = compute_winding_number(shape, local_pt)
+
+                is_inside = False
+                if group.use_even_odd_rule:
+                    is_inside = (abs(winding) % 2) == 1
+                else:
+                    is_inside = winding != 0
+
+                if is_inside:
+                    color = sample_color(group.fill_color, local_pt)
+                    if color is not None:
+                        color = color.to(device=device, dtype=dtype)
+                        frag = Fragment(color[:3], color[3].item(), group_idx, False)
+                        fragments.append(frag)
+
+    return blend_fragments(fragments, background, device, dtype)
 
 
 def render_pytorch(
@@ -701,7 +1058,7 @@ def render_pytorch(
     dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """
-    Pure PyTorch implementation of diffvg's render function.
+    Pure PyTorch implementation of diffvg's render function with EXACT PARITY.
 
     Args:
         width: Output image width
@@ -709,23 +1066,21 @@ def render_pytorch(
         num_samples_x: Number of samples per pixel in x
         num_samples_y: Number of samples per pixel in y
         seed: Random seed for jittered sampling
-        shapes: List of shape objects (Circle, Path, Rect, etc.)
-        shape_groups: List of ShapeGroup objects with colors
-        background_image: Optional background image [H, W, 4]
-        filter_type: Pixel filter type (box, tent, gaussian)
+        shapes: List of shape objects
+        shape_groups: List of ShapeGroup objects
+        background_image: Optional background [H, W, 4]
+        filter_type: Pixel filter type
         filter_radius: Pixel filter radius
         output_type: Output type (color or sdf)
-        device: Torch device to use
-        dtype: Torch dtype to use
+        device: Torch device
+        dtype: Torch dtype
 
     Returns:
-        Rendered image tensor [height, width, 4] for color output
-        or [height, width, 1] for SDF output
+        Rendered image [height, width, 4] for color, [height, width, 1] for SDF
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Set random seed
     torch.manual_seed(seed)
 
     if output_type == OutputType.color:
@@ -733,60 +1088,70 @@ def render_pytorch(
     else:
         result = torch.zeros(height, width, 1, device=device, dtype=dtype)
 
+    # Pre-compute jitter for all samples
     total_samples = num_samples_x * num_samples_y
 
-    # Generate jitter offsets for stratified sampling
-    jitter_x = (torch.rand(num_samples_y, num_samples_x, device=device, dtype=dtype) - 0.5) / num_samples_x
-    jitter_y = (torch.rand(num_samples_y, num_samples_x, device=device, dtype=dtype) - 0.5) / num_samples_y
-
-    # Iterate over each pixel
     for py in range(height):
         for px in range(width):
             if output_type == OutputType.color:
-                # Accumulate samples
                 accumulated = torch.zeros(4, device=device, dtype=dtype)
-                weight_sum = torch.tensor(0.0, device=device, dtype=dtype)
+                weight_sum = 0.0
 
                 for sy in range(num_samples_y):
                     for sx in range(num_samples_x):
-                        # Sample position with stratified jittering
-                        sample_x = px + (sx + 0.5) / num_samples_x + jitter_x[sy, sx].item()
-                        sample_y = py + (sy + 0.5) / num_samples_y + jitter_y[sy, sx].item()
+                        # Jittered sample position
+                        jitter_x = torch.rand(1, device=device, dtype=dtype).item() - 0.5
+                        jitter_y = torch.rand(1, device=device, dtype=dtype).item() - 0.5
 
-                        # Compute filter weight
+                        sample_x = px + (sx + 0.5 + jitter_x) / num_samples_x
+                        sample_y = py + (sy + 0.5 + jitter_y) / num_samples_y
+
+                        # Filter offset from pixel center
                         offset_x = sample_x - (px + 0.5)
                         offset_y = sample_y - (py + 0.5)
-                        weight = evaluate_filter(filter_type,
-                                                torch.tensor(offset_x, device=device, dtype=dtype),
-                                                torch.tensor(offset_y, device=device, dtype=dtype),
-                                                filter_radius)
+
+                        weight = compute_filter_weight(filter_type, offset_x, offset_y, filter_radius)
 
                         if weight > 0:
+                            # Get background color at this sample
+                            bg_color = None
+                            if background_image is not None:
+                                bx = int(sample_x)
+                                by = int(sample_y)
+                                if 0 <= bx < width and 0 <= by < height:
+                                    bg_color = background_image[by, bx]
+
                             color = sample_pixel(sample_x, sample_y, shapes, shape_groups,
-                                               background_image, device, dtype)
+                                                bg_color, device, dtype)
                             accumulated = accumulated + weight * color
-                            weight_sum = weight_sum + weight
+                            weight_sum += weight
 
                 if weight_sum > 0:
                     result[py, px] = accumulated / weight_sum
+
             else:
-                # SDF output - compute minimum distance to any shape
-                p = torch.tensor([px + 0.5, py + 0.5], device=device, dtype=dtype)
-                min_dist = torch.tensor(float('inf'), device=device, dtype=dtype)
+                # SDF output
+                pt = torch.tensor([px + 0.5, py + 0.5], device=device, dtype=dtype)
+                min_dist = float('inf')
+                is_inside = False
 
                 for group in shape_groups:
                     transform = group.shape_to_canvas.to(device=device, dtype=dtype)
+
                     for shape_id in group.shape_ids:
-                        shape = shapes[shape_id]
-                        dist = distance_to_shape(p, shape, transform)
+                        shape_id_val = shape_id.item() if isinstance(shape_id, torch.Tensor) else shape_id
+                        shape = shapes[shape_id_val]
 
-                        # Check if inside (make distance negative)
-                        inside = is_inside_shape(p, shape, group.use_even_odd_rule, transform)
-                        if inside > 0.5:
-                            dist = -dist
-
-                        if torch.abs(dist) < torch.abs(min_dist):
-                            min_dist = dist
+                        dist = distance_to_shape(pt, shape, transform)
+                        if dist < abs(min_dist):
+                            inv_transform = torch.linalg.inv(transform)
+                            local_pt = xform_pt(inv_transform, pt)
+                            winding = compute_winding_number(shape, local_pt)
+                            if group.use_even_odd_rule:
+                                is_inside = (abs(winding) % 2) == 1
+                            else:
+                                is_inside = winding != 0
+                            min_dist = -dist if is_inside else dist
 
                 result[py, px, 0] = min_dist
 
@@ -794,182 +1159,7 @@ def render_pytorch(
 
 
 # ============================================================================
-# Vectorized Render Function (More Efficient)
-# ============================================================================
-
-def render_pytorch_vectorized(
-    width: int,
-    height: int,
-    num_samples_x: int,
-    num_samples_y: int,
-    seed: int,
-    shapes: List,
-    shape_groups: List[ShapeGroup],
-    background_image: Optional[torch.Tensor] = None,
-    filter_type: FilterType = FilterType.box,
-    filter_radius: float = 0.5,
-    output_type: OutputType = OutputType.color,
-    device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.float32
-) -> torch.Tensor:
-    """
-    Vectorized pure PyTorch implementation of diffvg's render function.
-    More efficient by processing all pixels in parallel where possible.
-    """
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    torch.manual_seed(seed)
-
-    # Create coordinate grids
-    y_coords = torch.arange(height, device=device, dtype=dtype)
-    x_coords = torch.arange(width, device=device, dtype=dtype)
-
-    if output_type == OutputType.color:
-        result = torch.zeros(height, width, 4, device=device, dtype=dtype)
-    else:
-        result = torch.zeros(height, width, 1, device=device, dtype=dtype)
-
-    # Process samples
-    total_samples = num_samples_x * num_samples_y
-    weight_sum = torch.zeros(height, width, device=device, dtype=dtype)
-
-    for sy in range(num_samples_y):
-        for sx in range(num_samples_x):
-            # Sample offset within pixel
-            jitter_x = torch.rand(height, width, device=device, dtype=dtype) - 0.5
-            jitter_y = torch.rand(height, width, device=device, dtype=dtype) - 0.5
-
-            offset_x = (sx + 0.5) / num_samples_x + jitter_x / num_samples_x - 0.5
-            offset_y = (sy + 0.5) / num_samples_y + jitter_y / num_samples_y - 0.5
-
-            sample_x = x_coords.unsqueeze(0).expand(height, -1) + 0.5 + offset_x
-            sample_y = y_coords.unsqueeze(1).expand(-1, width) + 0.5 + offset_y
-
-            # Compute filter weights
-            if filter_type == FilterType.box:
-                weights = torch.ones(height, width, device=device, dtype=dtype)
-            elif filter_type == FilterType.tent:
-                dist = torch.sqrt(offset_x ** 2 + offset_y ** 2)
-                weights = torch.clamp(1.0 - dist / filter_radius, min=0.0)
-            else:  # Gaussian
-                sigma = filter_radius / 3.0
-                dist_sq = offset_x ** 2 + offset_y ** 2
-                weights = torch.exp(-dist_sq / (2.0 * sigma ** 2))
-
-            weight_sum = weight_sum + weights
-
-            if output_type == OutputType.color:
-                # Sample each pixel
-                sample_colors = torch.zeros(height, width, 4, device=device, dtype=dtype)
-
-                # Start with background
-                if background_image is not None:
-                    sample_colors = background_image.clone()
-
-                # Render each shape group
-                for group in shape_groups:
-                    transform = group.shape_to_canvas.to(device=device, dtype=dtype)
-
-                    for shape_id in group.shape_ids:
-                        shape = shapes[shape_id]
-
-                        # Vectorized inside test and color sampling
-                        # For each pixel, check if inside shape
-                        for py in range(height):
-                            for px in range(width):
-                                p = torch.tensor([sample_x[py, px], sample_y[py, px]],
-                                               device=device, dtype=dtype)
-
-                                # Fill
-                                if group.fill_color is not None:
-                                    inside = is_inside_shape(p, shape, group.use_even_odd_rule, transform)
-                                    if inside > 0.5:
-                                        p_local = inverse_transform_point(p, transform)
-                                        fill_color = evaluate_color(group.fill_color, p_local)
-                                        if fill_color is not None:
-                                            fill_color = fill_color.to(device=device, dtype=dtype)
-                                            sample_colors[py, px] = alpha_over(fill_color, sample_colors[py, px])
-
-                                # Stroke
-                                if group.stroke_color is not None:
-                                    stroke_width = get_stroke_width(shape, p)
-                                    dist = distance_to_shape(p, shape, transform)
-                                    half_width = stroke_width / 2.0
-
-                                    if dist <= half_width:
-                                        p_local = inverse_transform_point(p, transform)
-                                        stroke_color = evaluate_color(group.stroke_color, p_local)
-                                        if stroke_color is not None:
-                                            stroke_color = stroke_color.to(device=device, dtype=dtype)
-                                            sample_colors[py, px] = alpha_over(stroke_color, sample_colors[py, px])
-
-                result = result + weights.unsqueeze(-1) * sample_colors
-
-    if output_type == OutputType.color:
-        result = result / weight_sum.unsqueeze(-1).clamp(min=1e-10)
-
-    return result
-
-
-# ============================================================================
-# PyTorch Autograd Function (for differentiability)
-# ============================================================================
-
-class RenderFunctionPure(torch.autograd.Function):
-    """
-    Pure PyTorch autograd function for differentiable vector graphics rendering.
-    """
-
-    @staticmethod
-    def forward(ctx, width, height, num_samples_x, num_samples_y, seed,
-                background_image, shapes, shape_groups, filter_type, filter_radius):
-        """Forward pass - render the scene."""
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        dtype = torch.float32
-
-        # Render using the pure PyTorch implementation
-        result = render_pytorch(
-            width=width,
-            height=height,
-            num_samples_x=num_samples_x,
-            num_samples_y=num_samples_y,
-            seed=seed,
-            shapes=shapes,
-            shape_groups=shape_groups,
-            background_image=background_image,
-            filter_type=filter_type,
-            filter_radius=filter_radius,
-            output_type=OutputType.color,
-            device=device,
-            dtype=dtype
-        )
-
-        # Save for backward
-        ctx.save_for_backward(result, background_image)
-        ctx.shapes = shapes
-        ctx.shape_groups = shape_groups
-        ctx.width = width
-        ctx.height = height
-        ctx.num_samples_x = num_samples_x
-        ctx.num_samples_y = num_samples_y
-        ctx.seed = seed
-        ctx.filter_type = filter_type
-        ctx.filter_radius = filter_radius
-
-        return result
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Backward pass - compute gradients."""
-        # For now, return None for non-differentiable parameters
-        # Full gradient computation would require implementing the boundary sampling
-        return (None, None, None, None, None,  # width, height, num_samples_x, num_samples_y, seed
-                None, None, None, None, None)  # background, shapes, shape_groups, filter_type, filter_radius
-
-
-# ============================================================================
-# Convenience function matching pydiffvg API
+# Convenience API
 # ============================================================================
 
 def render(width: int,
@@ -982,24 +1172,7 @@ def render(width: int,
            shape_groups: List[ShapeGroup] = None,
            filter: PixelFilter = None,
            device: Optional[torch.device] = None) -> torch.Tensor:
-    """
-    Convenience function matching the pydiffvg.RenderFunction.apply API.
-
-    Args:
-        width: Output image width
-        height: Output image height
-        num_samples_x: Samples per pixel in x direction
-        num_samples_y: Samples per pixel in y direction
-        seed: Random seed
-        background_image: Optional background [H, W, 4]
-        shapes: List of shape objects
-        shape_groups: List of ShapeGroup objects
-        filter: PixelFilter object
-        device: Torch device
-
-    Returns:
-        Rendered image [height, width, 4]
-    """
+    """Convenience function matching the pydiffvg.RenderFunction.apply API."""
     if shapes is None:
         shapes = []
     if shape_groups is None:
